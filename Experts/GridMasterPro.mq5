@@ -11,29 +11,34 @@
 
 #include <Trade\Trade.mqh>
 
-//--- 交易设置
+sinput string _grp1 = "交易设置"; // ===== 交易设置 =====
 input double         InitialLot       = 0.01;           // 固定初始手数（UseDynamicLot=false时生效）
 input bool           UseDynamicLot    = true;           // 启用动态手数（按余额比例）
 input double         RiskPercent      = 1.0;            // 动态手数：余额风险百分比
-input int            FlatAddCount     = 3;              // 前N笔等量加仓（之后启用加仓模式）
+input int            FlatAddCount     = 5;              // 前N笔等量加仓（之后启用加仓模式）
 
-//--- 加仓模式
+sinput string _grp2 = "加仓模式"; // ===== 加仓模式 =====
 enum ENUM_ADD_MODE {
     ADD_MARTIN   = 0,    // 马丁格尔（上一笔手数 × 倍数）
     ADD_FIBONACCI = 1    // 斐波那契（最远两笔手数之和）
 };
 input ENUM_ADD_MODE  AddMode          = ADD_MARTIN;     // 加仓手数模式
-input double         MartinMultiplier = 1.2;            // 马丁格尔倍数（上一笔手数 × 此值）
+input double         MartinMultiplier = 1.5;            // 马丁格尔倍数（上一笔手数 × 此值）
 input int            MaxPositions     = 50;             // 单方向最大持仓数
-input double         ATRAddMultiplier = 2.0;            // 加仓间距基础ATR倍数
-input double         ATRStepIncrement = 0.5;            // 加仓间距递增（每多一笔增加ATR倍数）
+input double         ATRAddMultiplier = 1.0;            // 加仓间距基础ATR倍数
+input double         ATRStepIncrement = 0.2;            // 加仓间距递增（每多一笔增加ATR倍数）
 input int            CooldownBars     = 20;             // 回撤恢复后冷却K线数
 input int            ATRPeriod        = 5;              // ATR周期
+input double         MinBodyATRRatio  = 0.5;            // 入场K线最小实体/ATR比例（最近一根阳线/阴线实体≥ATR×此值）
 
-//--- 止盈设置
-input int            TakeProfitPoints = 50;            // 固定止盈点数（距离加权均价）
+sinput string _grp3 = "布林带加仓过滤"; // ===== 布林带加仓过滤 =====
+input int            BBPeriod         = 20;             // 布林带周期
+input double         BBDeviation      = 2.0;            // 布林带标准差倍数
 
-//--- 风控管理
+sinput string _grp4 = "止盈设置"; // ===== 止盈设置 =====
+input double         ProfitPerPositionUSD = 2.0;       // 每笔持仓目标盈利（USD），N笔持仓盈利≥N×此值时平仓
+
+sinput string _grp5 = "风控管理"; // ===== 风控管理 =====
 input double         MaxDrawdownPct   = 30.0;           // 最大回撤百分比
 input int            MaxSpreadPoints  = 50;             // 最大点差（点）
 input bool           AllowBuy         = true;           // 允许做多
@@ -47,6 +52,7 @@ int      magicNumber;
 double   accountEquityStart;
 string   logFile;
 int      atrHandle;
+int      bbHandle;
 int      symbolDigits;
 double   symbolPoint;
 datetime cooldownUntil;
@@ -78,6 +84,13 @@ int OnInit() {
         return INIT_FAILED;
     }
 
+    // 创建布林带指标句柄
+    bbHandle = iBands(_Symbol, PERIOD_CURRENT, BBPeriod, 0, BBDeviation, PRICE_CLOSE);
+    if (bbHandle == INVALID_HANDLE) {
+        WriteLog("FAILED to create Bollinger Bands indicator handle");
+        return INIT_FAILED;
+    }
+
     lastBarTime = 0;
 
     string addModeStr = (AddMode == ADD_MARTIN) ?
@@ -85,7 +98,9 @@ int OnInit() {
     WriteLog("GridMaster Pro v4.0 initialized | Magic: " + IntegerToString(magicNumber) +
              " | Symbol: " + _Symbol + " | Strategy: 2-Candle Pattern + Dynamic Grid + Fixed TP" +
              " | AddMode: " + addModeStr + " after " + IntegerToString(FlatAddCount) + " flat" +
-             " | FixedTP: " + IntegerToString(TakeProfitPoints) + " points" +
+             " | MinBodyATR: " + DoubleToString(MinBodyATRRatio, 2) +
+             " | BB: " + IntegerToString(BBPeriod) + " / " + DoubleToString(BBDeviation, 1) +
+             " | ProfitTP: " + DoubleToString(ProfitPerPositionUSD, 2) + " USD/pos" +
              " | DynamicLot: " + (UseDynamicLot ? "ON " + DoubleToString(RiskPercent, 1) + "%" : "OFF"));
 
     return INIT_SUCCEEDED;
@@ -96,6 +111,7 @@ int OnInit() {
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
     if (atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
+    if (bbHandle != INVALID_HANDLE) IndicatorRelease(bbHandle);
     WriteLog("EA deinitialized. Reason: " + IntegerToString(reason) +
              " | Positions: " + IntegerToString(CountPositions(POSITION_TYPE_BUY) + CountPositions(POSITION_TYPE_SELL)));
 }
@@ -164,8 +180,9 @@ void OnTick() {
     bool   isBear1 = (open1 > close1);   // bar[1] 阴线
     bool   isBull2 = (close2 > open2);   // bar[2] 阳线
     bool   isBear2 = (open2 > close2);   // bar[2] 阴线
-    bool   twoBull = (isBull1 && isBull2);  // 连续两根阳线
-    bool   twoBear = (isBear1 && isBear2);  // 连续两根阴线
+    bool   body1Strong = (atr > 0 && body1 >= atr * MinBodyATRRatio);  // bar[1]实体够大
+    bool   twoBull = (isBull1 && isBull2 && body1Strong);  // 连续两根阳线且最近一根实体够大
+    bool   twoBear = (isBear1 && isBear2 && body1Strong);  // 连续两根阴线且最近一根实体够大
 
     // --- 6. K线形态入场 ---
     int buyCount  = CountPositions(POSITION_TYPE_BUY);
@@ -207,39 +224,25 @@ void OnTick() {
 }
 
 //+------------------------------------------------------------------+
-//| 固定点数止盈：加权均价到达固定点数盈利时平掉所有持仓              |
+//| 美元盈利止盈：N笔持仓总盈利≥N×ProfitPerPositionUSD时平掉所有持仓 |
 //+------------------------------------------------------------------+
 void CheckFixedTP(ENUM_POSITION_TYPE dir) {
     int count = CountPositions(dir);
     if (count <= 0) return;
 
-    double avgEntry = GetAvgEntryPrice(dir);
-    if (avgEntry <= 0) return;
+    double profit = GetTotalProfit(dir);
+    double target = count * ProfitPerPositionUSD;
 
-    double tpDistance = TakeProfitPoints * symbolPoint;
-
-    if (dir == POSITION_TYPE_BUY) {
-        double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-        if (bid - avgEntry >= tpDistance) {
-            double profit = GetTotalProfit(dir);
-            ClosePositionsByType(dir);
-            WriteLog("FIXED TP BUY | Positions: " + IntegerToString(count) +
-                     " | AvgEntry: " + DoubleToString(avgEntry, symbolDigits) +
-                     " | Exit: " + DoubleToString(bid, symbolDigits) +
-                     " | TP Points: " + IntegerToString(TakeProfitPoints) +
-                     " | Profit: " + DoubleToString(profit, 2));
-        }
-    } else {
-        double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-        if (avgEntry - ask >= tpDistance) {
-            double profit = GetTotalProfit(dir);
-            ClosePositionsByType(dir);
-            WriteLog("FIXED TP SELL | Positions: " + IntegerToString(count) +
-                     " | AvgEntry: " + DoubleToString(avgEntry, symbolDigits) +
-                     " | Exit: " + DoubleToString(ask, symbolDigits) +
-                     " | TP Points: " + IntegerToString(TakeProfitPoints) +
-                     " | Profit: " + DoubleToString(profit, 2));
-        }
+    if (profit >= target) {
+        double avgEntry = GetAvgEntryPrice(dir);
+        ClosePositionsByType(dir);
+        string dirStr = (dir == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+        WriteLog("PROFIT TP " + dirStr + " | Positions: " + IntegerToString(count) +
+                 " | AvgEntry: " + DoubleToString(avgEntry, symbolDigits) +
+                 " | Profit: " + DoubleToString(profit, 2) +
+                 " USD | Target: " + DoubleToString(target, 2) +
+                 " USD (=" + IntegerToString(count) + " x " +
+                 DoubleToString(ProfitPerPositionUSD, 2) + ")");
     }
 }
 
@@ -268,6 +271,31 @@ void CheckMartingale(ENUM_POSITION_TYPE dir, double currentPrice, double atr) {
         shouldAdd = (currentPrice >= extremePrice + addDistance);
 
     if (!shouldAdd) return;
+
+    // --- 布林带过滤：价格超出布林带外轨时不加仓，避免强趋势中逆势加仓 ---
+    double bbUpper[], bbLower[];
+    ArraySetAsSeries(bbUpper, true);
+    ArraySetAsSeries(bbLower, true);
+    if (CopyBuffer(bbHandle, 1, 0, 2, bbUpper) <= 0 ||
+        CopyBuffer(bbHandle, 2, 0, 2, bbLower) <= 0) return;
+    double upperBand = bbUpper[1];
+    double lowerBand = bbLower[1];
+
+    if (dir == POSITION_TYPE_BUY) {
+        // 多头加仓：价格在下轨下方（强下跌趋势），禁止加仓
+        if (currentPrice < lowerBand) {
+            if (DebugMode) WriteLog("BUY ADD blocked — price below BB lower band (" +
+                     DoubleToString(lowerBand, symbolDigits) + ")");
+            return;
+        }
+    } else {
+        // 空头加仓：价格在上轨上方（强上涨趋势），禁止加仓
+        if (currentPrice > upperBand) {
+            if (DebugMode) WriteLog("SELL ADD blocked — price above BB upper band (" +
+                     DoubleToString(upperBand, symbolDigits) + ")");
+            return;
+        }
+    }
 
     // 加仓手数计算：前 FlatAddCount 笔等量，之后按选定模式递增
     double newLot;
