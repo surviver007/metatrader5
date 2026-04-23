@@ -301,12 +301,18 @@ void CheckMartingale(ENUM_POSITION_TYPE dir, double currentPrice, double atr) {
         // 马丁格尔：取最近一笔的手数 × 倍数
         double lastLot = GetLastLot(dir);
         newLot = NormalizeLot(lastLot * MartinMultiplier);
+        // 确保 NormalizeLot 向下取整后至少增加一个步长
+        if (newLot <= lastLot)
+            newLot = NormalizeLot(lastLot + SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP));
         addModeStr = "MARTIN x" + DoubleToString(MartinMultiplier, 1);
     } else {
         // 斐波那契：最远两笔手数之和
         double lot1, lot2;
         GetTwoExtremeLots(dir, lot1, lot2);
         newLot = NormalizeLot(lot1 + lot2);
+        double lastLot = GetLastLot(dir);
+        if (newLot <= lastLot)
+            newLot = NormalizeLot(lastLot + SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP));
         addModeStr = "FIB";
     }
 
