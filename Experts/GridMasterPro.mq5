@@ -7,7 +7,7 @@
 #property link      "https://www.mql5.com"
 #property version   "4.0"
 #property strict
-#property description "连续两根阳线/阴线形态 + 动态间距加仓策略（固定点数止盈）"
+#property description "单根阳线/阴线形态 + 动态间距加仓策略（固定点数止盈）"
 
 #include <Trade\Trade.mqh>
 
@@ -28,17 +28,20 @@ input int            MaxPositions     = 50;             // 单方向最大持仓
 input double         ATRAddMultiplier = 1.0;            // 加仓间距基础ATR倍数
 input double         ATRStepIncrement = 0.2;            // 加仓间距递增（每多一笔增加ATR倍数）
 input int            CooldownBars     = 20;             // 回撤恢复后冷却K线数
-input int            ATRPeriod        = 5;              // ATR周期
+input int            ATRPeriod        = 2;              // ATR周期
 input double         MinBodyATRRatio  = 0.5;            // 入场K线最小实体/ATR比例（最近一根阳线/阴线实体≥ATR×此值）
 
-sinput string _grp3 = "布林带加仓过滤"; // ===== 布林带加仓过滤 =====
+sinput string _grp3 = "趋势过滤"; // ===== 趋势过滤 =====
+input int            MAPeriod         = 120;            // 均线周期（价格在此线上方才做多，下方才做空）
+
+sinput string _grp4 = "布林带加仓过滤"; // ===== 布林带加仓过滤 =====
 input int            BBPeriod         = 20;             // 布林带周期
 input double         BBDeviation      = 2.0;            // 布林带标准差倍数
 
-sinput string _grp4 = "止盈设置"; // ===== 止盈设置 =====
+sinput string _grp5 = "止盈设置"; // ===== 止盈设置 =====
 input double         ProfitPerPositionUSD = 2.0;       // 每笔持仓目标盈利（USD），N笔持仓盈利≥N×此值时平仓
 
-sinput string _grp5 = "风控管理"; // ===== 风控管理 =====
+sinput string _grp6 = "风控管理"; // ===== 风控管理 =====
 input double         MaxDrawdownPct   = 30.0;           // 最大回撤百分比
 input int            MaxSpreadPoints  = 50;             // 最大点差（点）
 input bool           AllowBuy         = true;           // 允许做多
@@ -53,6 +56,7 @@ double   accountEquityStart;
 string   logFile;
 int      atrHandle;
 int      bbHandle;
+int      maHandle;
 int      symbolDigits;
 double   symbolPoint;
 datetime cooldownUntil;
@@ -91,6 +95,13 @@ int OnInit() {
         return INIT_FAILED;
     }
 
+    // 创建均线指标句柄
+    maHandle = iMA(_Symbol, PERIOD_CURRENT, MAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    if (maHandle == INVALID_HANDLE) {
+        WriteLog("FAILED to create MA indicator handle");
+        return INIT_FAILED;
+    }
+
     lastBarTime = 0;
 
     string addModeStr = (AddMode == ADD_MARTIN) ?
@@ -112,6 +123,7 @@ int OnInit() {
 void OnDeinit(const int reason) {
     if (atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
     if (bbHandle != INVALID_HANDLE) IndicatorRelease(bbHandle);
+    if (maHandle != INVALID_HANDLE) IndicatorRelease(maHandle);
     WriteLog("EA deinitialized. Reason: " + IntegerToString(reason) +
              " | Positions: " + IntegerToString(CountPositions(POSITION_TYPE_BUY) + CountPositions(POSITION_TYPE_SELL)));
 }
@@ -169,48 +181,51 @@ void OnTick() {
     }
     lastBarTime = currentBarTime;
 
-    // --- 5. 读取最近两根已完成K线（bar[1] 和 bar[2]） ---
+    // --- 5. 读取最近一根已完成K线（bar[1]） ---
     double open1  = iOpen(_Symbol, PERIOD_CURRENT, 1);
     double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
-    double open2  = iOpen(_Symbol, PERIOD_CURRENT, 2);
-    double close2 = iClose(_Symbol, PERIOD_CURRENT, 2);
     double body1  = MathAbs(close1 - open1);
-    double body2  = MathAbs(close2 - open2);
     bool   isBull1 = (close1 > open1);   // bar[1] 阳线
     bool   isBear1 = (open1 > close1);   // bar[1] 阴线
-    bool   isBull2 = (close2 > open2);   // bar[2] 阳线
-    bool   isBear2 = (open2 > close2);   // bar[2] 阴线
     bool   body1Strong = (atr > 0 && body1 >= atr * MinBodyATRRatio);  // bar[1]实体够大
-    bool   twoBull = (isBull1 && isBull2 && body1Strong);  // 连续两根阳线且最近一根实体够大
-    bool   twoBear = (isBear1 && isBear2 && body1Strong);  // 连续两根阴线且最近一根实体够大
+    bool   oneBull = (isBull1 && body1Strong);  // 单根阳线且实体够大
+    bool   oneBear = (isBear1 && body1Strong);  // 单根阴线且实体够大
+
+    // --- 5b. 均线趋势过滤 ---
+    double maVal[];
+    ArraySetAsSeries(maVal, true);
+    bool maReady = (CopyBuffer(maHandle, 0, 0, 2, maVal) > 0);
+    double ma = maReady ? maVal[1] : 0;   // 已完成K线对应的均线值
+    bool aboveMA = (ma > 0 && close1 > ma);   // 价格在均线上方
+    bool belowMA = (ma > 0 && close1 < ma);   // 价格在均线下方
 
     // --- 6. K线形态入场 ---
     int buyCount  = CountPositions(POSITION_TYPE_BUY);
     int sellCount = CountPositions(POSITION_TYPE_SELL);
 
-    // 做多：连续两根阳线，且当前无多头持仓
-    if (!inCooldown && AllowBuy && twoBull && buyCount == 0) {
+    // 做多：单根阳线实体够大 + 价格在均线上方，且当前无多头持仓
+    if (!inCooldown && AllowBuy && oneBull && aboveMA && buyCount == 0) {
         double lot = CalcDynamicLot();
         if (CheckMargin(ORDER_TYPE_BUY, ask, lot)) {
             if (trade.Buy(lot, _Symbol, ask, 0, 0, "CANDLE BUY #1")) {
                 WriteLog("CANDLE BUY #1 | Price: " + DoubleToString(ask, symbolDigits) +
-                         " | Body1: " + DoubleToString(body1, symbolDigits) +
-                         " Body2: " + DoubleToString(body2, symbolDigits) +
+                         " | Body: " + DoubleToString(body1, symbolDigits) +
                          " | ATR: " + DoubleToString(atr, symbolDigits) +
+                         " | MA: " + DoubleToString(ma, symbolDigits) +
                          " | Lot: " + DoubleToString(lot, 2));
             }
         }
     }
 
-    // 做空：连续两根阴线，且当前无空头持仓
-    if (!inCooldown && AllowSell && twoBear && sellCount == 0) {
+    // 做空：单根阴线实体够大 + 价格在均线下方，且当前无空头持仓
+    if (!inCooldown && AllowSell && oneBear && belowMA && sellCount == 0) {
         double lot = CalcDynamicLot();
         if (CheckMargin(ORDER_TYPE_SELL, bid, lot)) {
             if (trade.Sell(lot, _Symbol, bid, 0, 0, "CANDLE SELL #1")) {
                 WriteLog("CANDLE SELL #1 | Price: " + DoubleToString(bid, symbolDigits) +
-                         " | Body1: " + DoubleToString(body1, symbolDigits) +
-                         " Body2: " + DoubleToString(body2, symbolDigits) +
+                         " | Body: " + DoubleToString(body1, symbolDigits) +
                          " | ATR: " + DoubleToString(atr, symbolDigits) +
+                         " | MA: " + DoubleToString(ma, symbolDigits) +
                          " | Lot: " + DoubleToString(lot, 2));
             }
         }
