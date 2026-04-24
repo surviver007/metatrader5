@@ -46,6 +46,13 @@ input bool           AllowSell        = false;          // 允许做空
 input int            MagicBase        = 47291;          // 魔术号
 input bool           DebugMode        = false;          // 调试模式
 
+sinput string _grp6 = "趋势对冲策略"; // ===== 趋势对冲策略 =====
+input bool           EnableTrendStrategy      = false;   // 启用趋势对冲策略
+input int            TrendMaxAdds             = 10;       // 最大加仓次数（不含初始入场）
+input double         TrendAddATRMultiplier    = 1.0;     // 加仓间距ATR倍数
+input double         TrendTrailATRMultiplier  = 3.0;     // 追踪止盈ATR倍数
+input double         TrendLotMultiplier       = 1.0;     // 趋势手数倍数（相对动态手数）
+
 //--- 全局变量
 CTrade   trade;
 int      magicNumber;
@@ -57,6 +64,10 @@ int      symbolDigits;
 double   symbolPoint;
 datetime cooldownUntil;
 datetime lastBarTime;
+int      trendMagicNumber;     // 趋势策略魔术号
+datetime trendLastBarTime;     // 趋势策略新K线检测
+double   trendBuyPeakPrice;    // 趋势做多追踪峰值价
+double   trendSellPeakPrice;   // 趋势做空追踪谷值价
 
 //+------------------------------------------------------------------+
 //| EA 初始化                                                        |
@@ -93,15 +104,25 @@ int OnInit() {
 
     lastBarTime = 0;
 
+    // 趋势策略初始化
+    trendMagicNumber = MagicBase + 100000 + symbolHash + (int)Period();
+    trendLastBarTime = 0;
+    trendBuyPeakPrice = 0;
+    trendSellPeakPrice = 0;
+
     string addModeStr = (AddMode == ADD_MARTIN) ?
                          "Martin x" + DoubleToString(MartinMultiplier, 1) : "Fibonacci";
     WriteLog("GridMaster Pro v4.0 initialized | Magic: " + IntegerToString(magicNumber) +
+             " | TrendMagic: " + IntegerToString(trendMagicNumber) +
              " | Symbol: " + _Symbol + " | Strategy: 2-Candle Pattern + Dynamic Grid + Fixed TP" +
              " | AddMode: " + addModeStr + " after " + IntegerToString(FlatAddCount) + " flat" +
              " | MinBodyATR: " + DoubleToString(MinBodyATRRatio, 2) +
              " | BB: " + IntegerToString(BBPeriod) + " / " + DoubleToString(BBDeviation, 1) +
              " | ProfitTP: " + DoubleToString(ProfitPerPositionUSD, 2) + " USD/pos" +
-             " | DynamicLot: " + (UseDynamicLot ? "ON " + DoubleToString(RiskPercent, 1) + "%" : "OFF"));
+             " | DynamicLot: " + (UseDynamicLot ? "ON " + DoubleToString(RiskPercent, 1) + "%" : "OFF") +
+             " | Trend: " + (EnableTrendStrategy ? "ON BB=" + IntegerToString(BBPeriod) + "/" + DoubleToString(BBDeviation, 1) +
+                " MaxAdds=" + IntegerToString(TrendMaxAdds) +
+                " TrailATR=" + DoubleToString(TrendTrailATRMultiplier, 1) : "OFF"));
 
     return INIT_SUCCEEDED;
 }
@@ -113,7 +134,8 @@ void OnDeinit(const int reason) {
     if (atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
     if (bbHandle != INVALID_HANDLE) IndicatorRelease(bbHandle);
     WriteLog("EA deinitialized. Reason: " + IntegerToString(reason) +
-             " | Positions: " + IntegerToString(CountPositions(POSITION_TYPE_BUY) + CountPositions(POSITION_TYPE_SELL)));
+             " | Grid: " + IntegerToString(CountPositions(POSITION_TYPE_BUY) + CountPositions(POSITION_TYPE_SELL)) +
+             " | Trend: " + IntegerToString(CountTrendPositions(POSITION_TYPE_BUY) + CountTrendPositions(POSITION_TYPE_SELL)));
 }
 
 //+------------------------------------------------------------------+
@@ -131,6 +153,7 @@ void OnTick() {
     if (CheckDrawdown()) {
         WriteLog("DRAWDOWN LIMIT REACHED — closing all positions");
         CloseAllPositions();
+        if (EnableTrendStrategy) CloseTrendPositions();
         accountEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
         cooldownUntil = iTime(_Symbol, PERIOD_CURRENT, 0) + CooldownBars * PeriodSeconds(PERIOD_CURRENT);
         WriteLog("Drawdown recovery — equity baseline reset to " + DoubleToString(accountEquityStart, 2) +
@@ -159,60 +182,67 @@ void OnTick() {
 
     // --- 4. 新K线检测（避免同根K线重复入场） ---
     datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
-    if (currentBarTime == lastBarTime) {
-        // 非新K线，跳过入场但继续处理加仓
-        if (atr > 0) {
-            if (AllowBuy)  CheckMartingale(POSITION_TYPE_BUY, ask, atr);
-            if (AllowSell) CheckMartingale(POSITION_TYPE_SELL, bid, atr);
+    bool newGridBar = (currentBarTime != lastBarTime);
+    if (newGridBar) lastBarTime = currentBarTime;
+
+    // --- 5. 网格策略：K线形态入场（仅新K线） ---
+    if (newGridBar) {
+        double open1  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+        double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+        double body1  = MathAbs(close1 - open1);
+        bool   isBull1 = (close1 > open1);   // bar[1] 阳线
+        bool   isBear1 = (open1 > close1);   // bar[1] 阴线
+        bool   body1Strong = (atr > 0 && body1 >= atr * MinBodyATRRatio);  // bar[1]实体够大
+        bool   oneBull = (isBull1 && body1Strong);  // 单根阳线且实体够大
+        bool   oneBear = (isBear1 && body1Strong);  // 单根阴线且实体够大
+
+        int buyCount  = CountPositions(POSITION_TYPE_BUY);
+        int sellCount = CountPositions(POSITION_TYPE_SELL);
+
+        // 做多：单根阳线实体够大，且当前无多头持仓
+        if (!inCooldown && AllowBuy && oneBull && buyCount == 0) {
+            double lot = CalcDynamicLot();
+            if (CheckMargin(ORDER_TYPE_BUY, ask, lot)) {
+                if (trade.Buy(lot, _Symbol, ask, 0, 0, "CANDLE BUY #1")) {
+                    WriteLog("CANDLE BUY #1 | Price: " + DoubleToString(ask, symbolDigits) +
+                             " | Body: " + DoubleToString(body1, symbolDigits) +
+                             " | ATR: " + DoubleToString(atr, symbolDigits) +
+                             " | Lot: " + DoubleToString(lot, 2));
+                }
+            }
         }
-        return;
-    }
-    lastBarTime = currentBarTime;
 
-    // --- 5. 读取最近一根已完成K线（bar[1]） ---
-    double open1  = iOpen(_Symbol, PERIOD_CURRENT, 1);
-    double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
-    double body1  = MathAbs(close1 - open1);
-    bool   isBull1 = (close1 > open1);   // bar[1] 阳线
-    bool   isBear1 = (open1 > close1);   // bar[1] 阴线
-    bool   body1Strong = (atr > 0 && body1 >= atr * MinBodyATRRatio);  // bar[1]实体够大
-    bool   oneBull = (isBull1 && body1Strong);  // 单根阳线且实体够大
-    bool   oneBear = (isBear1 && body1Strong);  // 单根阴线且实体够大
-
-    // --- 6. K线形态入场 ---
-    int buyCount  = CountPositions(POSITION_TYPE_BUY);
-    int sellCount = CountPositions(POSITION_TYPE_SELL);
-
-    // 做多：单根阳线实体够大，且当前无多头持仓
-    if (!inCooldown && AllowBuy && oneBull && buyCount == 0) {
-        double lot = CalcDynamicLot();
-        if (CheckMargin(ORDER_TYPE_BUY, ask, lot)) {
-            if (trade.Buy(lot, _Symbol, ask, 0, 0, "CANDLE BUY #1")) {
-                WriteLog("CANDLE BUY #1 | Price: " + DoubleToString(ask, symbolDigits) +
-                         " | Body: " + DoubleToString(body1, symbolDigits) +
-                         " | ATR: " + DoubleToString(atr, symbolDigits) +
-                         " | Lot: " + DoubleToString(lot, 2));
+        // 做空：单根阴线实体够大，且当前无空头持仓
+        if (!inCooldown && AllowSell && oneBear && sellCount == 0) {
+            double lot = CalcDynamicLot();
+            if (CheckMargin(ORDER_TYPE_SELL, bid, lot)) {
+                if (trade.Sell(lot, _Symbol, bid, 0, 0, "CANDLE SELL #1")) {
+                    WriteLog("CANDLE SELL #1 | Price: " + DoubleToString(bid, symbolDigits) +
+                             " | Body: " + DoubleToString(body1, symbolDigits) +
+                             " | ATR: " + DoubleToString(atr, symbolDigits) +
+                             " | Lot: " + DoubleToString(lot, 2));
+                }
             }
         }
     }
 
-    // 做空：单根阴线实体够大，且当前无空头持仓
-    if (!inCooldown && AllowSell && oneBear && sellCount == 0) {
-        double lot = CalcDynamicLot();
-        if (CheckMargin(ORDER_TYPE_SELL, bid, lot)) {
-            if (trade.Sell(lot, _Symbol, bid, 0, 0, "CANDLE SELL #1")) {
-                WriteLog("CANDLE SELL #1 | Price: " + DoubleToString(bid, symbolDigits) +
-                         " | Body: " + DoubleToString(body1, symbolDigits) +
-                         " | ATR: " + DoubleToString(atr, symbolDigits) +
-                         " | Lot: " + DoubleToString(lot, 2));
-            }
-        }
-    }
-
-    // --- 7. 马丁格尔加仓（动态间距） ---
+    // --- 6. 网格策略：马丁格尔加仓（每个tick） ---
     if (atr > 0) {
         if (AllowBuy)  CheckMartingale(POSITION_TYPE_BUY, ask, atr);
         if (AllowSell) CheckMartingale(POSITION_TYPE_SELL, bid, atr);
+    }
+
+    // --- 7. 趋势对冲策略（如果启用） ---
+    if (EnableTrendStrategy && atr > 0) {
+        CheckTrendTrailStop(POSITION_TYPE_BUY, bid, atr);
+        CheckTrendTrailStop(POSITION_TYPE_SELL, bid, atr);
+        bool newTrendBar = (currentBarTime != trendLastBarTime);
+        if (newTrendBar) {
+            trendLastBarTime = currentBarTime;
+            CheckTrendBreakout(ask, bid, atr);
+            CheckTrendAdd(POSITION_TYPE_BUY, ask, atr);
+            CheckTrendAdd(POSITION_TYPE_SELL, bid, atr);
+        }
     }
 }
 
@@ -634,7 +664,8 @@ void WriteLog(string message) {
         StringFind(message, "deinitialized") >= 0 ||
         StringFind(message, "resumed") >= 0 ||
         StringFind(message, "WARNING") >= 0 ||
-        StringFind(message, "recovery") >= 0;
+        StringFind(message, "recovery") >= 0 ||
+        StringFind(message, "TREND") >= 0;
 
     if (!DebugMode && !isImportant) return;
 
@@ -644,6 +675,232 @@ void WriteLog(string message) {
         string ts = TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES | TIME_SECONDS);
         FileWriteString(handle, ts + " | " + message + "\n");
         FileClose(handle);
+    }
+}
+//+------------------------------------------------------------------+
+//| 趋势对冲策略函数                                                 |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| 按方向统计趋势策略持仓数量                                       |
+//+------------------------------------------------------------------+
+int CountTrendPositions(ENUM_POSITION_TYPE posType) {
+    int count = 0;
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        ulong ticket = PositionGetTicket(i);
+        if (ticket == 0) continue;
+        if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        if (PositionGetInteger(POSITION_MAGIC) != trendMagicNumber) continue;
+        if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == posType)
+            count++;
+    }
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| 获取趋势策略极端入场价（做多=最高价，做空=最低价）               |
+//+------------------------------------------------------------------+
+double GetTrendExtremeEntryPrice(ENUM_POSITION_TYPE posType) {
+    double result = 0;
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        ulong ticket = PositionGetTicket(i);
+        if (ticket == 0) continue;
+        if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        if (PositionGetInteger(POSITION_MAGIC) != trendMagicNumber) continue;
+        if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != posType) continue;
+
+        double p = PositionGetDouble(POSITION_PRICE_OPEN);
+        if (posType == POSITION_TYPE_BUY) {
+            if (result == 0 || p > result) result = p;
+        } else {
+            if (result == 0 || p < result) result = p;
+        }
+    }
+    return result;
+}
+
+//+------------------------------------------------------------------+
+//| 按方向获取趋势策略总浮盈                                         |
+//+------------------------------------------------------------------+
+double GetTrendTotalProfit(ENUM_POSITION_TYPE posType) {
+    double total = 0;
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        ulong ticket = PositionGetTicket(i);
+        if (ticket == 0) continue;
+        if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        if (PositionGetInteger(POSITION_MAGIC) != trendMagicNumber) continue;
+        if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != posType) continue;
+        total += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+    }
+    return total;
+}
+
+//+------------------------------------------------------------------+
+//| 平掉所有趋势策略持仓                                             |
+//+------------------------------------------------------------------+
+void CloseTrendPositions() {
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        ulong ticket = PositionGetTicket(i);
+        if (ticket == 0) continue;
+        if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        if (PositionGetInteger(POSITION_MAGIC) != trendMagicNumber) continue;
+        trade.PositionClose(ticket);
+    }
+    trendBuyPeakPrice = 0;
+    trendSellPeakPrice = 0;
+}
+
+//+------------------------------------------------------------------+
+//| 趋势策略：布林带上下轨突破入场（多空双向）                       |
+//+------------------------------------------------------------------+
+void CheckTrendBreakout(double ask, double bid, double atr) {
+    // 读取布林带上下轨（使用已完成K线 bar[1]）
+    double bbUpper[], bbLower[];
+    ArraySetAsSeries(bbUpper, true);
+    ArraySetAsSeries(bbLower, true);
+    if (CopyBuffer(bbHandle, 1, 0, 2, bbUpper) <= 0 ||
+        CopyBuffer(bbHandle, 2, 0, 2, bbLower) <= 0) return;
+    double upperBand = bbUpper[1];
+    double lowerBand = bbLower[1];
+
+    // 做多突破：ask突破布林带上轨
+    int trendBuyCount = CountTrendPositions(POSITION_TYPE_BUY);
+    if (trendBuyCount == 0 && ask > upperBand) {
+        double lot = NormalizeLot(CalcDynamicLot() * TrendLotMultiplier);
+        if (CheckMargin(ORDER_TYPE_BUY, ask, lot)) {
+            trade.SetExpertMagicNumber(trendMagicNumber);
+            if (trade.Buy(lot, _Symbol, ask, 0, 0, "TREND BUY #1")) {
+                trendBuyPeakPrice = bid;
+                WriteLog("TREND BREAKOUT BUY #1 | Price: " + DoubleToString(ask, symbolDigits) +
+                         " | BB Upper: " + DoubleToString(upperBand, symbolDigits) +
+                         " | ATR: " + DoubleToString(atr, symbolDigits) +
+                         " | Lot: " + DoubleToString(lot, 2));
+            }
+            trade.SetExpertMagicNumber(magicNumber);
+        }
+    }
+
+    // 做空突破：bid跌破布林带下轨
+    int trendSellCount = CountTrendPositions(POSITION_TYPE_SELL);
+    if (trendSellCount == 0 && bid < lowerBand) {
+        double lot = NormalizeLot(CalcDynamicLot() * TrendLotMultiplier);
+        if (CheckMargin(ORDER_TYPE_SELL, bid, lot)) {
+            trade.SetExpertMagicNumber(trendMagicNumber);
+            if (trade.Sell(lot, _Symbol, bid, 0, 0, "TREND SELL #1")) {
+                trendSellPeakPrice = bid;
+                WriteLog("TREND BREAKOUT SELL #1 | Price: " + DoubleToString(bid, symbolDigits) +
+                         " | BB Lower: " + DoubleToString(lowerBand, symbolDigits) +
+                         " | ATR: " + DoubleToString(atr, symbolDigits) +
+                         " | Lot: " + DoubleToString(lot, 2));
+            }
+            trade.SetExpertMagicNumber(magicNumber);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 趋势策略：顺势加仓                                               |
+//+------------------------------------------------------------------+
+void CheckTrendAdd(ENUM_POSITION_TYPE dir, double price, double atr) {
+    int count = CountTrendPositions(dir);
+    if (count <= 0 || count > TrendMaxAdds) return;
+
+    double extremePrice = GetTrendExtremeEntryPrice(dir);
+    if (extremePrice <= 0) return;
+
+    double addDistance = atr * TrendAddATRMultiplier;
+    bool shouldAdd = false;
+
+    if (dir == POSITION_TYPE_BUY)
+        shouldAdd = (price >= extremePrice + addDistance);
+    else
+        shouldAdd = (price <= extremePrice - addDistance);
+
+    if (!shouldAdd) return;
+
+    double lot = NormalizeLot(CalcDynamicLot() * TrendLotMultiplier);
+    ENUM_ORDER_TYPE orderType = (dir == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+    if (!CheckMargin(orderType, price, lot)) return;
+
+    string comment = ((dir == POSITION_TYPE_BUY) ? "TREND BUY #" : "TREND SELL #") +
+                     IntegerToString(count + 1);
+    string dirStr = (dir == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+
+    trade.SetExpertMagicNumber(trendMagicNumber);
+    bool sent = false;
+    if (dir == POSITION_TYPE_BUY)
+        sent = trade.Buy(lot, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_ASK), 0, 0, comment);
+    else
+        sent = trade.Sell(lot, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_BID), 0, 0, comment);
+
+    if (sent) {
+        WriteLog("TREND ADD " + dirStr + " #" + IntegerToString(count + 1) +
+                 " | Price: " + DoubleToString(price, symbolDigits) +
+                 " | Lot: " + DoubleToString(lot, 2) +
+                 " | ATR x" + DoubleToString(TrendAddATRMultiplier, 1) +
+                 " | Distance: " + DoubleToString(addDistance, symbolDigits) +
+                 " | Total trend positions: " + IntegerToString(count + 1));
+    }
+    trade.SetExpertMagicNumber(magicNumber);
+}
+
+//+------------------------------------------------------------------+
+//| 趋势策略：ATR追踪止盈                                            |
+//+------------------------------------------------------------------+
+void CheckTrendTrailStop(ENUM_POSITION_TYPE dir, double bid, double atr) {
+    int count = CountTrendPositions(dir);
+    if (count <= 0) {
+        // 无持仓时重置峰/谷值
+        if (dir == POSITION_TYPE_BUY) trendBuyPeakPrice = 0;
+        else trendSellPeakPrice = 0;
+        return;
+    }
+
+    double trailDistance = atr * TrendTrailATRMultiplier;
+    string dirStr = (dir == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+
+    if (dir == POSITION_TYPE_BUY) {
+        // 做多：跟踪bid最高值
+        if (bid > trendBuyPeakPrice) trendBuyPeakPrice = bid;
+        // bid从峰值回撤超过ATR × 倍数时平仓
+        if (trendBuyPeakPrice > 0 && bid < trendBuyPeakPrice - trailDistance) {
+            double profit = GetTrendTotalProfit(POSITION_TYPE_BUY);
+            WriteLog("TREND TRAIL STOP " + dirStr + " | Bid: " + DoubleToString(bid, symbolDigits) +
+                     " | Peak: " + DoubleToString(trendBuyPeakPrice, symbolDigits) +
+                     " | Trail: " + DoubleToString(trailDistance, symbolDigits) +
+                     " | Positions: " + IntegerToString(count) +
+                     " | Profit: " + DoubleToString(profit, 2) + " USD");
+            CloseTrendPositionsByDir(POSITION_TYPE_BUY);
+            trendBuyPeakPrice = 0;
+        }
+    } else {
+        // 做空：跟踪bid最低值
+        if (trendSellPeakPrice == 0 || bid < trendSellPeakPrice) trendSellPeakPrice = bid;
+        // bid从谷值反弹超过ATR × 倍数时平仓
+        if (trendSellPeakPrice > 0 && bid > trendSellPeakPrice + trailDistance) {
+            double profit = GetTrendTotalProfit(POSITION_TYPE_SELL);
+            WriteLog("TREND TRAIL STOP " + dirStr + " | Bid: " + DoubleToString(bid, symbolDigits) +
+                     " | Trough: " + DoubleToString(trendSellPeakPrice, symbolDigits) +
+                     " | Trail: " + DoubleToString(trailDistance, symbolDigits) +
+                     " | Positions: " + IntegerToString(count) +
+                     " | Profit: " + DoubleToString(profit, 2) + " USD");
+            CloseTrendPositionsByDir(POSITION_TYPE_SELL);
+            trendSellPeakPrice = 0;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 按方向平掉趋势策略持仓                                           |
+//+------------------------------------------------------------------+
+void CloseTrendPositionsByDir(ENUM_POSITION_TYPE posType) {
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        ulong ticket = PositionGetTicket(i);
+        if (ticket == 0) continue;
+        if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        if (PositionGetInteger(POSITION_MAGIC) != trendMagicNumber) continue;
+        if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == posType)
+            trade.PositionClose(ticket);
     }
 }
 //+------------------------------------------------------------------+
