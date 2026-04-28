@@ -14,7 +14,7 @@
 sinput string _grp1 = "交易设置"; // ===== 交易设置 =====
 input double         InitialLot       = 0.01;           // 固定初始手数（UseDynamicLot=false时生效）
 input bool           UseDynamicLot    = true;           // 启用动态手数（按余额比例）
-input double         RiskPercent      = 1.0;            // 动态手数：余额风险百分比
+input double         RiskPercent      = 0.2;            // 动态手数：余额风险百分比
 input int            FlatAddCount     = 9;              // 前N笔等量加仓（之后启用加仓模式）
 
 sinput string _grp2 = "加仓模式"; // ===== 加仓模式 =====
